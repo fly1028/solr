@@ -123,22 +123,27 @@ public final class MultiFields extends Fields {
         newFields = existingSegmentFields.getValue();
       } else if(!noSegmentMerged){
         // some cached segments are merged, we need to rebuild
-        oldFields = staticSegmentFields.remove(existingSegmentFields.getKey());
+        synchronized (staticSegmentFields) {
+          oldFields = staticSegmentFields.remove(existingSegmentFields.getKey());
+        }
       } else if(!newLeafReaderFieldsContexts.isEmpty()){
         // new segments are introduced not already cached
         synchronized (staticSegmentFields) {
-          final Map.Entry<Set<IndexReader.CacheKey>, Fields> synchronizedExistingSegmentFields = staticSegmentFields.entrySet().stream().findFirst().get();
-          newLeafReaderFieldsContexts = reader.leaves().stream().filter(ctx -> !synchronizedExistingSegmentFields.getKey().contains(ctx.reader().getCoreCacheHelper().getKey())).collect(Collectors.toList());
-          if (!newLeafReaderFieldsContexts.isEmpty()) {
-            // if there are changes to segments, we need to find the diff and call addSegmentFields()
-            fields = synchronizedExistingSegmentFields.getValue();
-            if (fields instanceof MultiFields) {
-              MultiFields multiFields = (MultiFields) fields;
-              staticSegmentFields.remove(synchronizedExistingSegmentFields.getKey());
-              for (LeafReaderContext leafReaderContext : newLeafReaderFieldsContexts) {
-                newFields = addSegmentFields(leafReaderContext, new ArrayList<>(Arrays.asList(multiFields.subs)), new ArrayList<>(Arrays.asList(multiFields.subSlices)));
+          existingSegmentFieldsOptional = staticSegmentFields.entrySet().stream().findFirst();
+          if(existingSegmentFieldsOptional.isPresent()) {
+            final Map.Entry<Set<IndexReader.CacheKey>, Fields> synchronizedExistingSegmentFields = existingSegmentFieldsOptional.get();
+            newLeafReaderFieldsContexts = reader.leaves().stream().filter(ctx -> !synchronizedExistingSegmentFields.getKey().contains(ctx.reader().getCoreCacheHelper().getKey())).collect(Collectors.toList());
+            if (!newLeafReaderFieldsContexts.isEmpty()) {
+              // if there are changes to segments, we need to find the diff and call addSegmentFields()
+              fields = synchronizedExistingSegmentFields.getValue();
+              if (fields instanceof MultiFields) {
+                MultiFields multiFields = (MultiFields) fields;
+                staticSegmentFields.remove(synchronizedExistingSegmentFields.getKey());
+                for (LeafReaderContext leafReaderContext : newLeafReaderFieldsContexts) {
+                  newFields = addSegmentFields(leafReaderContext, new ArrayList<>(Arrays.asList(multiFields.subs)), new ArrayList<>(Arrays.asList(multiFields.subSlices)));
+                }
+                staticSegmentFields.put(inputSegmentFieldsCacheKey, newFields);
               }
-              staticSegmentFields.put(inputSegmentFieldsCacheKey, newFields);
             }
           }
         }
@@ -225,24 +230,29 @@ public final class MultiFields extends Fields {
         return staticSegmentFieldInfos.computeIfAbsent(inputSegmentFieldsCacheKey, key -> finalBuilder.finish());
       }else if(!noSegmentMerged){
         // some cached segments are merged, we need to rebuild
+        synchronized (staticSegmentFieldInfosBuilder) {
           staticSegmentFieldInfos.remove(existingSegmentFieldInfos.getKey());
           staticSegmentFieldInfosBuilder.remove(existingSegmentFieldInfos.getKey());
+        }
       } else if(!newLeafReaderFieldInfosContexts.isEmpty()){
         // new segments are introduced not already cached
         synchronized (staticSegmentFieldInfosBuilder) {
-          final Map.Entry<Set<IndexReader.CacheKey>, FieldInfos.Builder> synchronizedExistingSegmentFieldInfos = staticSegmentFieldInfosBuilder.entrySet().stream().findFirst().get();
-          newLeafReaderFieldInfosContexts = reader.leaves().stream().filter(ctx -> !synchronizedExistingSegmentFieldInfos.getKey().contains(ctx.reader().getCoreCacheHelper().getKey())).collect(Collectors.toList());
-          if (!newLeafReaderFieldInfosContexts.isEmpty()) {
-            staticSegmentFieldInfos.remove(synchronizedExistingSegmentFieldInfos.getKey());
-            staticSegmentFieldInfosBuilder.remove(synchronizedExistingSegmentFieldInfos.getKey());
+          existingSegmentFieldInfosOptional = staticSegmentFieldInfosBuilder.entrySet().stream().findFirst();
+          if(existingSegmentFieldInfosOptional.isPresent()) {
+            final Map.Entry<Set<IndexReader.CacheKey>, FieldInfos.Builder> synchronizedExistingSegmentFieldInfos = existingSegmentFieldInfosOptional.get();
+            newLeafReaderFieldInfosContexts = reader.leaves().stream().filter(ctx -> !synchronizedExistingSegmentFieldInfos.getKey().contains(ctx.reader().getCoreCacheHelper().getKey())).collect(Collectors.toList());
+            if (!newLeafReaderFieldInfosContexts.isEmpty()) {
+              staticSegmentFieldInfos.remove(synchronizedExistingSegmentFieldInfos.getKey());
+              staticSegmentFieldInfosBuilder.remove(synchronizedExistingSegmentFieldInfos.getKey());
 
-            // if there are changes to segments, we need to find the diff and call addSegmentFieldInfos()
-            for (LeafReaderContext leafReaderContext : newLeafReaderFieldInfosContexts) {
-              builder = addSegmentFieldInfos(leafReaderContext, builder);
+              // if there are changes to segments, we need to find the diff and call addSegmentFieldInfos()
+              for (LeafReaderContext leafReaderContext : newLeafReaderFieldInfosContexts) {
+                builder = addSegmentFieldInfos(leafReaderContext, builder);
+              }
+              staticSegmentFieldInfosBuilder.put(inputSegmentFieldsCacheKey, builder);
+              final FieldInfos.Builder finalBuilder = builder;
+              return staticSegmentFieldInfos.computeIfAbsent(inputSegmentFieldsCacheKey, key -> finalBuilder.finish());
             }
-            staticSegmentFieldInfosBuilder.put(inputSegmentFieldsCacheKey, builder);
-            final FieldInfos.Builder finalBuilder = builder;
-            return staticSegmentFieldInfos.computeIfAbsent(inputSegmentFieldsCacheKey, key -> finalBuilder.finish());
           }
         }
       }

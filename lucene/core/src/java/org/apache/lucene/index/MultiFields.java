@@ -156,7 +156,7 @@ public final class MultiFields extends Fields {
         throw new UncheckedIOException(e);
       }
     });
-
+/*
     // we can only close whatever leaf reader that's no longer passed as leaf of the input CompositeReader
     if(oldFields instanceof MultiFields){
       Set<IndexReader.CacheKey> newCacheKeys = new HashSet<>();
@@ -181,7 +181,7 @@ public final class MultiFields extends Fields {
         }
       }
     }
-
+ */
     return newFields;
   }
 
@@ -471,7 +471,7 @@ public final class MultiFields extends Fields {
 
     LeafReaderFields(LeafReader leafReader) {
       this.leafReader = leafReader;
-      this.leafReader.incRef();
+      //this.leafReader.incRef();
       this.indexedFields = new ArrayList<>();
       for (FieldInfo fieldInfo : leafReader.getFieldInfos()) {
         if (fieldInfo.getIndexOptions() != IndexOptions.NONE) {
@@ -495,9 +495,9 @@ public final class MultiFields extends Fields {
     public Terms terms(String field) throws IOException {
       return leafReader.terms(field);
     }
-    public void close() throws IOException {
-      leafReader.decRef();
-    }
+//    public void close() throws IOException {
+//      leafReader.decRef();
+//    }
   }
 }
 

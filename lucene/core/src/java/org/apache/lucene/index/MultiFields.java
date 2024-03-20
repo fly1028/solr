@@ -18,7 +18,9 @@ package org.apache.lucene.index;
 
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
@@ -26,7 +28,10 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+import java.util.Optional;
 
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
@@ -52,7 +57,6 @@ public final class MultiFields extends Fields {
   private final Fields[] subs;
   private final ReaderSlice[] subSlices;
   private final Map<String,Terms> terms = new ConcurrentHashMap<>();
-
   /** Returns a single {@link Fields} instance for this
    *  reader, merging fields/terms/docs/positions on the
    *  fly.  This method will return null if the reader 
@@ -61,7 +65,7 @@ public final class MultiFields extends Fields {
    *  <p><b>NOTE</b>: this is a slow way to access postings.
    *  It's better to get the sub-readers and iterate through them
    *  yourself. */
-  public static Fields getFields(IndexReader reader) throws IOException {
+  private static Fields doGetFields(IndexReader reader) throws IOException {
     final List<LeafReaderContext> leaves = reader.leaves();
     switch (leaves.size()) {
       case 1:
@@ -84,6 +88,168 @@ public final class MultiFields extends Fields {
         }
     }
   }
+
+  private static Map<Set<IndexReader.CacheKey>, Fields> staticSegmentFields = new ConcurrentHashMap<>();
+  private static Fields addSegmentFields(LeafReaderContext ctx, List<Fields> fields, List<ReaderSlice> slices){
+    final LeafReader r = ctx.reader();
+    final Fields f = new MultiFields.LeafReaderFields(r);
+    fields.add(f);
+    slices.add(new ReaderSlice(ctx.docBase, r.maxDoc(), fields.size()-1));
+    if (fields.size() == 1) {
+      return fields.get(0);
+    } else {
+      return new MultiFields(fields.toArray(Fields.EMPTY_ARRAY),
+          slices.toArray(ReaderSlice.EMPTY_ARRAY));
+    }
+  }
+  public static Fields getFields(IndexReader reader) throws IOException {
+    Fields newFields = null;
+    Fields oldFields = null;
+    Optional<Map.Entry<Set<IndexReader.CacheKey>, Fields>> existingSegmentFieldsOptional = staticSegmentFields.entrySet().stream().findFirst();
+    final Set<IndexReader.CacheKey> inputSegmentFieldsCacheKey = reader.leaves().stream().map(ctx -> ctx.reader().getCoreCacheHelper().getKey()).collect(Collectors.toSet());
+
+    if (existingSegmentFieldsOptional.isPresent()) {
+      final Map.Entry<Set<IndexReader.CacheKey>, Fields> existingSegmentFields = existingSegmentFieldsOptional.get();
+      Fields fields = null;
+
+      // find input leaf readers that are not in the cache
+      List<LeafReaderContext> newLeafReaderFieldsContexts = reader.leaves().stream().filter(ctx -> !existingSegmentFields.getKey().contains(ctx.reader().getCoreCacheHelper().getKey())).collect(Collectors.toList());
+
+      // if there's no merge that caused some segment to be gone since the last time we cache
+      boolean noSegmentMerged = inputSegmentFieldsCacheKey.containsAll(existingSegmentFields.getKey());
+
+      // if there's no new segments and our existing cached segments are matching the input (segments not merged)
+      if (inputSegmentFieldsCacheKey.equals(existingSegmentFields.getKey())) {
+        newFields = existingSegmentFields.getValue();
+      } else if(!noSegmentMerged){
+        // some cached segments are merged, we need to rebuild
+        oldFields = staticSegmentFields.remove(existingSegmentFields.getKey());
+      } else if(!newLeafReaderFieldsContexts.isEmpty()){
+        // new segments are introduced not already cached
+        synchronized (staticSegmentFields) {
+          final Map.Entry<Set<IndexReader.CacheKey>, Fields> synchronizedExistingSegmentFields = staticSegmentFields.entrySet().stream().findFirst().get();
+          newLeafReaderFieldsContexts = reader.leaves().stream().filter(ctx -> !synchronizedExistingSegmentFields.getKey().contains(ctx.reader().getCoreCacheHelper().getKey())).collect(Collectors.toList());
+          if (!newLeafReaderFieldsContexts.isEmpty()) {
+            // if there are changes to segments, we need to find the diff and call addSegmentFields()
+            fields = synchronizedExistingSegmentFields.getValue();
+            if (fields instanceof MultiFields) {
+              MultiFields multiFields = (MultiFields) fields;
+              staticSegmentFields.remove(synchronizedExistingSegmentFields.getKey());
+              for (LeafReaderContext leafReaderContext : newLeafReaderFieldsContexts) {
+                newFields = addSegmentFields(leafReaderContext, new ArrayList<>(Arrays.asList(multiFields.subs)), new ArrayList<>(Arrays.asList(multiFields.subSlices)));
+              }
+              staticSegmentFields.put(inputSegmentFieldsCacheKey, newFields);
+            }
+          }
+        }
+      }
+    }
+
+    if(newFields != null){
+      return newFields;
+    }
+
+    newFields = staticSegmentFields.computeIfAbsent(inputSegmentFieldsCacheKey, key -> {
+      try {
+        return doGetFields(reader);
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+    });
+
+    // we can only close whatever leaf reader that's no longer passed as leaf of the input CompositeReader
+    if(oldFields instanceof MultiFields){
+      Set<IndexReader.CacheKey> newCacheKeys = new HashSet<>();
+      if(newFields instanceof MultiFields){
+        for(Fields field : ((MultiFields)newFields).subs){
+          if(field instanceof LeafReaderFields){
+            LeafReaderFields leafReaderFields = (LeafReaderFields) field;
+            newCacheKeys.add(leafReaderFields.leafReader.getCoreCacheHelper().getKey());
+          }
+        }
+      }else{
+        newCacheKeys.add(((LeafReaderFields) newFields).leafReader.getCoreCacheHelper().getKey());
+      }
+      MultiFields oldMultiFields = (MultiFields) oldFields;
+      for(Fields field : oldMultiFields.subs){
+        if(field instanceof LeafReaderFields){
+          LeafReaderFields leafReaderFields = (LeafReaderFields) field;
+          if(!newCacheKeys.contains(leafReaderFields.leafReader.getCoreCacheHelper().getKey())) {
+            // decRef() old readers which were incRef() by addSegmentFields() and is no longer referenced now
+            leafReaderFields.close();
+          }
+        }
+      }
+    }
+
+    return newFields;
+  }
+
+
+  private static Map<Set<IndexReader.CacheKey>, FieldInfos.Builder> staticSegmentFieldInfosBuilder = new ConcurrentHashMap<>();
+  private static Map<Set<IndexReader.CacheKey>, FieldInfos> staticSegmentFieldInfos = new ConcurrentHashMap<>();
+
+  private static FieldInfos.Builder addSegmentFieldInfos(LeafReaderContext ctx, FieldInfos.Builder fieldInfosBuilder){
+    String newSoftDeletesField = ctx.reader().getFieldInfos().getSoftDeletesField();
+    FieldInfos.Builder builder;
+
+    if(newSoftDeletesField == null) {
+      builder = fieldInfosBuilder;
+    }else{
+      // we can't reuse if newSoftDeletesField is not null
+      builder = new FieldInfos.Builder(new FieldInfos.FieldNumbers(newSoftDeletesField));
+      builder.add(fieldInfosBuilder.finish());
+    }
+    builder.add(ctx.reader().getFieldInfos());
+    return builder;
+  }
+
+  public static FieldInfos getMergedFieldInfos(IndexReader reader){
+
+    Optional<Map.Entry<Set<IndexReader.CacheKey>, FieldInfos.Builder>> existingSegmentFieldInfosOptional = staticSegmentFieldInfosBuilder.entrySet().stream().findFirst();
+    final Set<IndexReader.CacheKey> inputSegmentFieldsCacheKey = reader.leaves().stream().map(ctx -> ctx.reader().getCoreCacheHelper().getKey()).collect(Collectors.toSet());
+
+    if(existingSegmentFieldInfosOptional.isPresent()){
+      final Map.Entry<Set<IndexReader.CacheKey>, FieldInfos.Builder> existingSegmentFieldInfos = existingSegmentFieldInfosOptional.get();
+      FieldInfos.Builder builder = existingSegmentFieldInfos.getValue();
+
+      // find input leaf readers that are not in the cache
+      List<LeafReaderContext> newLeafReaderFieldInfosContexts = reader.leaves().stream().filter(ctx -> !existingSegmentFieldInfos.getKey().contains(ctx.reader().getCoreCacheHelper().getKey())).collect(Collectors.toList());
+
+      // if there's no merge that caused some segment to be gone since the last time we cache
+      boolean noSegmentMerged = inputSegmentFieldsCacheKey.containsAll(existingSegmentFieldInfos.getKey());
+
+      // if there's no new segments and our existing cached segments are matching the input (segments not merged)
+      if (inputSegmentFieldsCacheKey.equals(existingSegmentFieldInfos.getKey())) {
+        final FieldInfos.Builder finalBuilder = builder;
+        return staticSegmentFieldInfos.computeIfAbsent(inputSegmentFieldsCacheKey, key -> finalBuilder.finish());
+      }else if(!noSegmentMerged){
+        // some cached segments are merged, we need to rebuild
+          staticSegmentFieldInfos.remove(existingSegmentFieldInfos.getKey());
+          staticSegmentFieldInfosBuilder.remove(existingSegmentFieldInfos.getKey());
+      } else if(!newLeafReaderFieldInfosContexts.isEmpty()){
+        // new segments are introduced not already cached
+        synchronized (staticSegmentFieldInfosBuilder) {
+          final Map.Entry<Set<IndexReader.CacheKey>, FieldInfos.Builder> synchronizedExistingSegmentFieldInfos = staticSegmentFieldInfosBuilder.entrySet().stream().findFirst().get();
+          newLeafReaderFieldInfosContexts = reader.leaves().stream().filter(ctx -> !synchronizedExistingSegmentFieldInfos.getKey().contains(ctx.reader().getCoreCacheHelper().getKey())).collect(Collectors.toList());
+          if (!newLeafReaderFieldInfosContexts.isEmpty()) {
+            staticSegmentFieldInfos.remove(synchronizedExistingSegmentFieldInfos.getKey());
+            staticSegmentFieldInfosBuilder.remove(synchronizedExistingSegmentFieldInfos.getKey());
+
+            // if there are changes to segments, we need to find the diff and call addSegmentFieldInfos()
+            for (LeafReaderContext leafReaderContext : newLeafReaderFieldInfosContexts) {
+              builder = addSegmentFieldInfos(leafReaderContext, builder);
+            }
+            staticSegmentFieldInfosBuilder.put(inputSegmentFieldsCacheKey, builder);
+            final FieldInfos.Builder finalBuilder = builder;
+            return staticSegmentFieldInfos.computeIfAbsent(inputSegmentFieldsCacheKey, key -> finalBuilder.finish());
+          }
+        }
+      }
+    }
+    return staticSegmentFieldInfos.computeIfAbsent(inputSegmentFieldsCacheKey, key -> staticSegmentFieldInfosBuilder.computeIfAbsent(inputSegmentFieldsCacheKey, key2 -> doGetMergedFieldInfos(reader)).finish());
+  }
+
 
   /** Returns a single {@link Bits} instance for this
    *  reader, merging live Documents on the
@@ -263,12 +429,10 @@ public final class MultiFields extends Fields {
    *  readers, and codec metadata ({@link FieldInfo#getAttribute(String)}
    *  will be unavailable.
    */
-  public static FieldInfos getMergedFieldInfos(IndexReader reader) {
+  private static FieldInfos.Builder doGetMergedFieldInfos(IndexReader reader) {
     final List<LeafReaderContext> leaves = reader.leaves();
     if (leaves.isEmpty()) {
-      return FieldInfos.EMPTY;
-    } else if (leaves.size() == 1) {
-      return leaves.get(0).reader().getFieldInfos();
+      return new FieldInfos.Builder(new FieldInfos.FieldNumbers(null));
     } else {
       final String softDeletesField = leaves.stream()
           .map(l -> l.reader().getFieldInfos().getSoftDeletesField())
@@ -278,7 +442,7 @@ public final class MultiFields extends Fields {
       for (final LeafReaderContext ctx : leaves) {
         builder.add(ctx.reader().getFieldInfos());
       }
-      return builder.finish();
+      return builder;
     }
   }
 
@@ -307,6 +471,7 @@ public final class MultiFields extends Fields {
 
     LeafReaderFields(LeafReader leafReader) {
       this.leafReader = leafReader;
+      this.leafReader.incRef();
       this.indexedFields = new ArrayList<>();
       for (FieldInfo fieldInfo : leafReader.getFieldInfos()) {
         if (fieldInfo.getIndexOptions() != IndexOptions.NONE) {
@@ -329,6 +494,9 @@ public final class MultiFields extends Fields {
     @Override
     public Terms terms(String field) throws IOException {
       return leafReader.terms(field);
+    }
+    public void close() throws IOException {
+      leafReader.decRef();
     }
   }
 }

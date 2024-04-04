@@ -19,20 +19,29 @@ package org.apache.lucene.index;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import java.util.Optional;
 
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.MergedIterator;
@@ -65,134 +74,348 @@ public final class MultiFields extends Fields {
    *  <p><b>NOTE</b>: this is a slow way to access postings.
    *  It's better to get the sub-readers and iterate through them
    *  yourself. */
-  private static Fields doGetFields(IndexReader reader) throws IOException {
-    final List<LeafReaderContext> leaves = reader.leaves();
-    switch (leaves.size()) {
-      case 1:
-        // already an atomic reader / reader with one leave
-        return new LeafReaderFields(leaves.get(0).reader());
-      default:
-        final List<Fields> fields = new ArrayList<>(leaves.size());
-        final List<ReaderSlice> slices = new ArrayList<>(leaves.size());
-        for (final LeafReaderContext ctx : leaves) {
-          final LeafReader r = ctx.reader();
-          final Fields f = new LeafReaderFields(r);
-          fields.add(f);
-          slices.add(new ReaderSlice(ctx.docBase, r.maxDoc(), fields.size()-1));
-        }
-        if (fields.size() == 1) {
-          return fields.get(0);
-        } else {
-          return new MultiFields(fields.toArray(Fields.EMPTY_ARRAY),
-                                         slices.toArray(ReaderSlice.EMPTY_ARRAY));
-        }
-    }
+  private static MultiFields doGetFields(IndexReader reader) throws IOException {
+    return doGetFields(reader, r -> true);
   }
 
-  private static Map<Set<IndexReader.CacheKey>, Fields> staticSegmentFields = new ConcurrentHashMap<>();
-  private static Fields addSegmentFields(LeafReaderContext ctx, List<Fields> fields, List<ReaderSlice> slices){
+  private static MultiFields doGetFields(IndexReader reader, Predicate<LeafReader> filter) throws IOException {
+    final List<LeafReaderContext> leaves = reader.leaves();
+    final List<Fields> fields = new ArrayList<>(leaves.size());
+    final List<ReaderSlice> slices = new ArrayList<>(leaves.size());
+    for (final LeafReaderContext ctx : leaves) {
+      final LeafReader r = ctx.reader();
+      if(!filter.test(r)){
+        continue;
+      }
+      final Fields f = new LeafReaderFields(r);
+      fields.add(f);
+      slices.add(new ReaderSlice(ctx.docBase, r.maxDoc(), fields.size()-1));
+    }
+    return new MultiFields(fields.toArray(Fields.EMPTY_ARRAY),
+        slices.toArray(ReaderSlice.EMPTY_ARRAY));
+  }
+
+  private static MultiFields addSegmentFields(LeafReaderContext ctx, List<Fields> fields, List<ReaderSlice> slices){
     final LeafReader r = ctx.reader();
     final Fields f = new MultiFields.LeafReaderFields(r);
     fields.add(f);
     slices.add(new ReaderSlice(ctx.docBase, r.maxDoc(), fields.size()-1));
-    if (fields.size() == 1) {
-      return fields.get(0);
-    } else {
-      return new MultiFields(fields.toArray(Fields.EMPTY_ARRAY),
-          slices.toArray(ReaderSlice.EMPTY_ARRAY));
+    return new MultiFields(fields.toArray(Fields.EMPTY_ARRAY),
+        slices.toArray(ReaderSlice.EMPTY_ARRAY));
+  }
+
+  /**
+   * Finds the entry with the key representing the largest non-empty subset of the input set among the provided map entries.
+   *
+   * @param map       The map containing key-value entries.
+   * @param inputSet  The input set for which the largest non-empty subset key is to be found.
+   * @param <K>       The type of elements in the sets.
+   * @param <V>       The type of values in the map.
+   * @return          The entry containing the key representing the largest non-empty subset of the input set and its corresponding value,
+   *                  or null if no such entry is found.
+   */
+  private static <K, V> Map.Entry<Set<K>, V> findEntryWithLargestSubsetKey(Map<Set<K>, V> map, Set<K> inputSet) {
+    return map.entrySet().stream()
+        .filter(entry -> !entry.getKey().isEmpty()) // Filter out empty subsets
+        .filter(entry -> inputSet.containsAll(entry.getKey()))
+        .max(Comparator.comparingInt(entry -> entry.getKey().size()))
+        .orElse(null);
+  }
+
+  /*
+
+  Main Index: [seg1, seg2, seg3] -> Fields                                                                             1 entry per solr core
+  Main Index + Commit Buffer: [seg1, seg2, seg3] + [segA, segB, segC] -> Fields                                        1 entry per solr core
+  Main Index + Commit Buffer + Private Index: [seg1, seg2, seg3] + [segA, segB, segC] + [segX, segY, segZ] -> Fields   1 entry per TxID
+
+  Given a composite IndexReader, we divide up the leave readers into 3 categories based on the directory of the segment readers
+
+  First check the input composite reader to see if there's any private index reader (based on directory pattern), if there's any we will build a private index view based on the commit buffer view + main index view
+  If there's no private index reader, we check to see if there's any commit buffer reader (again based on directory pattern), if there's any we will build a commit buffer view based on the main index view
+  If there's only main index reader we will build a main index view
+
+  For main index view: check to see if the main index segments in the input composite reader matches our cached Main Index segments, if there's no exact match, always rebuild main index segments cache (to be optimized if needed but main index only view is rare)
+  Second, check to see if the commit buffer index segments in the input composite reader matches our cached Commit Buffer segments, if more segments in the input, take the cached commit buffer segments and add more segments to it. if less, rebuild commit buffer segments cache.
+  Last, take the main index segment + commit buffer index segments and add private index segment to it and add to the private index segments cache.
+
+  lookup from shardPrivateIndexSegmentFields, if no exact match, lookup main + commit buffer cacheKey from shardCommitBufferSegmentFields, if no exact match, lookup main cacheKey from shardMainSegmentFields
+   */
+  private static final Map<Directory, Map<Set<IndexReader.CacheKey>, MultiFields>> mainSegmentFieldsCache = new ConcurrentHashMap<>();
+  private static final Map<Directory, Map<Set<IndexReader.CacheKey>, MultiFields>> commitBufferSegmentFieldsCache = new ConcurrentHashMap<>();
+  private static final Map<Directory, Map<Set<IndexReader.CacheKey>, MultiFields>> privateIndexSegmentFieldsCache = new ConcurrentHashMap<>();
+
+  private static final Pattern PRIVATE_INDEX_DIR_PATTERN = Pattern.compile("[a-fA-F0-9]{32}");
+  private static final Pattern COMMIT_BUFFER_DIR_PATTERN = Pattern.compile("COMMIT_BUFFER_[a-fA-F0-9]{32}");
+
+  public static Fields getFields(IndexReader reader) throws IOException {
+
+    if(!(reader instanceof DirectoryReader)){
+      return doGetFields(reader);
+    }
+
+    final DirectoryReader directoryReader = (DirectoryReader) reader;
+    final Directory mainDirectory = directoryReader.directory();
+    final Map<Set<IndexReader.CacheKey>, MultiFields> privateSegmentFields = privateIndexSegmentFieldsCache.computeIfAbsent(mainDirectory, d -> new ConcurrentHashMap<>());
+    final Map<Set<IndexReader.CacheKey>, MultiFields> commitBufferSegmentFields = commitBufferSegmentFieldsCache.computeIfAbsent(mainDirectory, d -> new ConcurrentHashMap<>());
+    final Map<Set<IndexReader.CacheKey>, MultiFields> mainSegmentFields = mainSegmentFieldsCache.computeIfAbsent(mainDirectory, d -> new ConcurrentHashMap<>());
+
+
+    final Set<IndexReader.CacheKey> mainInputSegmentFields = new HashSet<>();
+    final Set<IndexReader.CacheKey> commitBufferInputSegmentFields = new HashSet<>();
+    final Set<IndexReader.CacheKey> privateIndexInputSegmentFields = new HashSet<>();
+    final List<LeafReader> mainInputLeafReaders = new LinkedList<>();
+    final List<LeafReader> commitBufferInputLeafReaders = new LinkedList<>();
+    final List<LeafReader> privateIndexInputLeafReaders = new LinkedList<>();
+
+    reader.leaves().forEach(ctx -> {
+      // TODO: .filter(r -> r instanceof CodecReader) and .filter(r -> r instanceof SegmentReader) ?
+      LeafReader leafReader = FilterLeafReader.unwrap(ctx.reader());
+      SegmentReader segmentReader = (SegmentReader) FilterCodecReader.unwrap((CodecReader) leafReader);
+      Directory unwrappedDir = FilterDirectory.unwrap(segmentReader.directory());
+      Path segmentPath = ((FSDirectory) unwrappedDir).getDirectory();
+      IndexReader.CacheKey cacheKey = segmentReader.getCoreCacheHelper().getKey();
+      if(COMMIT_BUFFER_DIR_PATTERN.matcher(segmentPath.toString()).find()){
+        commitBufferInputLeafReaders.add(ctx.reader());
+        commitBufferInputSegmentFields.add(cacheKey);
+      }else if(PRIVATE_INDEX_DIR_PATTERN.matcher(segmentPath.toString()).find()){
+        privateIndexInputLeafReaders.add(ctx.reader());
+        privateIndexInputSegmentFields.add(cacheKey);
+      }else{
+        mainInputLeafReaders.add(ctx.reader());
+        mainInputSegmentFields.add(cacheKey);
+      }
+      //System.out.println("Segment: " + segmentPath + "/" + segmentReader.getSegmentName());
+    });
+
+//    System.out.println("privateSegmentFields: " + privateSegmentFields.size());
+//    System.out.println("commitBufferSegmentFields: " + commitBufferSegmentFields.size());
+//    System.out.println("mainSegmentFields: " + mainSegmentFields.size());
+
+    final Set<IndexReader.CacheKey> commitBufferIndexKey = new HashSet<>();
+    commitBufferIndexKey.addAll(mainInputSegmentFields);
+    commitBufferIndexKey.addAll(commitBufferInputSegmentFields);
+
+    // This is a private index view with txId
+    if(!privateIndexInputLeafReaders.isEmpty()) {
+      final Set<IndexReader.CacheKey> privateIndexKey = new HashSet<>();
+      privateIndexKey.addAll(mainInputSegmentFields);
+      privateIndexKey.addAll(commitBufferInputSegmentFields);
+      privateIndexKey.addAll(privateIndexInputSegmentFields);
+      // We can have 1 cache entry per txId
+      return privateSegmentFields.computeIfAbsent(privateIndexKey, key -> {
+        MultiFields multiFields = computeCommitBufferMultiFields(reader,  mainInputSegmentFields, mainSegmentFields, mainInputLeafReaders, commitBufferIndexKey, commitBufferSegmentFields, commitBufferInputLeafReaders);;
+        // Build private index multi fields from commitBufferMultiFields and store into cache
+        for (LeafReader commitBufferReader : privateIndexInputLeafReaders) {
+          multiFields = addSegmentFields(commitBufferReader.getContext(), new ArrayList<>(Arrays.asList(multiFields.subs)), new ArrayList<>(Arrays.asList(multiFields.subSlices)));
+          // register on private index segment closed listener
+          commitBufferReader.getCoreCacheHelper().addClosedListener(closedCacheKey ->
+              privateSegmentFields.entrySet().removeIf(entry -> entry.getKey().contains(closedCacheKey)));
+        }
+
+        return multiFields;
+      });
+    // This is a commit buffer only view without txid
+    }else if (!commitBufferInputLeafReaders.isEmpty()){
+      return computeCommitBufferMultiFields(reader, mainInputSegmentFields, mainSegmentFields, mainInputLeafReaders, commitBufferIndexKey, commitBufferSegmentFields, commitBufferInputLeafReaders);
+   // This is a main index only view
+    }else{
+      return computeMainIndexMultiFields(reader, mainInputSegmentFields, mainSegmentFields, mainInputLeafReaders);
     }
   }
-  public static Fields getFields(IndexReader reader) throws IOException {
-    Fields newFields = null;
-    Fields oldFields = null;
-    Optional<Map.Entry<Set<IndexReader.CacheKey>, Fields>> existingSegmentFieldsOptional = staticSegmentFields.entrySet().stream().findFirst();
-    final Set<IndexReader.CacheKey> inputSegmentFieldsCacheKey = reader.leaves().stream().map(ctx -> ctx.reader().getCoreCacheHelper().getKey()).collect(Collectors.toSet());
 
-    if (existingSegmentFieldsOptional.isPresent()) {
-      final Map.Entry<Set<IndexReader.CacheKey>, Fields> existingSegmentFields = existingSegmentFieldsOptional.get();
-      Fields fields = null;
+  private static MultiFields computeMainIndexMultiFields(IndexReader reader, Set<IndexReader.CacheKey> inputSegmentFields, Map<Set<IndexReader.CacheKey>, MultiFields> segmentFieldsCache, List<LeafReader> inputLeafReaders) {
+    Optional<Map.Entry<Set<IndexReader.CacheKey>, MultiFields>> existingFields = segmentFieldsCache.entrySet().stream().findFirst();
+    MultiFields multiFields = null;
 
-      // find input leaf readers that are not in the cache
-      List<LeafReaderContext> newLeafReaderFieldsContexts = reader.leaves().stream().filter(ctx -> !existingSegmentFields.getKey().contains(ctx.reader().getCoreCacheHelper().getKey())).collect(Collectors.toList());
-
-      // if there's no merge that caused some segment to be gone since the last time we cache
-      boolean noSegmentMerged = inputSegmentFieldsCacheKey.containsAll(existingSegmentFields.getKey());
-
-      // if there's no new segments and our existing cached segments are matching the input (segments not merged)
-      if (inputSegmentFieldsCacheKey.equals(existingSegmentFields.getKey())) {
-        newFields = existingSegmentFields.getValue();
-      } else if(!noSegmentMerged){
-        // some cached segments are merged, we need to rebuild
-        synchronized (staticSegmentFields) {
-          oldFields = staticSegmentFields.remove(existingSegmentFields.getKey());
-        }
-      } else if(!newLeafReaderFieldsContexts.isEmpty()){
-        // new segments are introduced not already cached
-        synchronized (staticSegmentFields) {
-          existingSegmentFieldsOptional = staticSegmentFields.entrySet().stream().findFirst();
-          if(existingSegmentFieldsOptional.isPresent()) {
-            final Map.Entry<Set<IndexReader.CacheKey>, Fields> synchronizedExistingSegmentFields = existingSegmentFieldsOptional.get();
-            newLeafReaderFieldsContexts = reader.leaves().stream().filter(ctx -> !synchronizedExistingSegmentFields.getKey().contains(ctx.reader().getCoreCacheHelper().getKey())).collect(Collectors.toList());
-            if (!newLeafReaderFieldsContexts.isEmpty()) {
-              // if there are changes to segments, we need to find the diff and call addSegmentFields()
-              fields = synchronizedExistingSegmentFields.getValue();
-              if (fields instanceof MultiFields) {
-                MultiFields multiFields = (MultiFields) fields;
-                staticSegmentFields.remove(synchronizedExistingSegmentFields.getKey());
-                for (LeafReaderContext leafReaderContext : newLeafReaderFieldsContexts) {
-                  newFields = addSegmentFields(leafReaderContext, new ArrayList<>(Arrays.asList(multiFields.subs)), new ArrayList<>(Arrays.asList(multiFields.subSlices)));
-                }
-                staticSegmentFields.put(inputSegmentFieldsCacheKey, newFields);
-              }
-            }
-          }
-        }
+    if (existingFields.isPresent()) {
+      Map.Entry<Set<IndexReader.CacheKey>, MultiFields> existingEntry = existingFields.get();
+      if (existingEntry.getKey().equals(inputSegmentFields)) {
+        multiFields = existingEntry.getValue();
+      } else {
+        segmentFieldsCache.remove(existingEntry.getKey());
       }
     }
 
-    if(newFields != null){
-      return newFields;
-    }
-
-    newFields = staticSegmentFields.computeIfAbsent(inputSegmentFieldsCacheKey, key -> {
+    if (multiFields == null) {
       try {
-        return doGetFields(reader);
+        multiFields = doGetFields(reader, inputLeafReaders::contains);
       } catch (IOException e) {
         throw new UncheckedIOException(e);
       }
-    });
-/*
-    // we can only close whatever leaf reader that's no longer passed as leaf of the input CompositeReader
-    if(oldFields instanceof MultiFields){
-      Set<IndexReader.CacheKey> newCacheKeys = new HashSet<>();
-      if(newFields instanceof MultiFields){
-        for(Fields field : ((MultiFields)newFields).subs){
-          if(field instanceof LeafReaderFields){
-            LeafReaderFields leafReaderFields = (LeafReaderFields) field;
-            newCacheKeys.add(leafReaderFields.leafReader.getCoreCacheHelper().getKey());
-          }
-        }
-      }else{
-        newCacheKeys.add(((LeafReaderFields) newFields).leafReader.getCoreCacheHelper().getKey());
-      }
-      MultiFields oldMultiFields = (MultiFields) oldFields;
-      for(Fields field : oldMultiFields.subs){
-        if(field instanceof LeafReaderFields){
-          LeafReaderFields leafReaderFields = (LeafReaderFields) field;
-          if(!newCacheKeys.contains(leafReaderFields.leafReader.getCoreCacheHelper().getKey())) {
-            // decRef() old readers which were incRef() by addSegmentFields() and is no longer referenced now
-            leafReaderFields.close();
-          }
-        }
+      segmentFieldsCache.put(inputSegmentFields, multiFields);
+    }
+
+    return multiFields;
+  }
+
+  private static FieldInfos.Builder computeMainIndexFieldInfosBuilder(IndexReader reader, Set<IndexReader.CacheKey> inputSegmentFields, Map<Set<IndexReader.CacheKey>, FieldInfos.Builder> mainSegmentFieldInfosBuilder, List<LeafReader> inputLeafReaders, Map<Set<IndexReader.CacheKey>, FieldInfos> mainIndexSegmentFieldInfos) {
+    Optional<Map.Entry<Set<IndexReader.CacheKey>, FieldInfos.Builder>> existingFields = mainSegmentFieldInfosBuilder.entrySet().stream().findFirst();
+    FieldInfos.Builder builder = null;
+
+    if (existingFields.isPresent()) {
+      Map.Entry<Set<IndexReader.CacheKey>, FieldInfos.Builder> existingEntry = existingFields.get();
+      if (existingEntry.getKey().equals(inputSegmentFields)) {
+        builder = existingEntry.getValue();
+      } else {
+        mainSegmentFieldInfosBuilder.remove(existingEntry.getKey());
+        mainIndexSegmentFieldInfos.remove(existingEntry.getKey());
       }
     }
- */
-    return newFields;
+
+    if (builder == null) {
+      builder = doGetMergedFieldInfos(reader, inputLeafReaders::contains);
+      mainSegmentFieldInfosBuilder.put(inputSegmentFields, builder);
+      mainIndexSegmentFieldInfos.put(inputSegmentFields, builder.finish());
+    }
+
+    return builder;
   }
 
 
-  private static Map<Set<IndexReader.CacheKey>, FieldInfos.Builder> staticSegmentFieldInfosBuilder = new ConcurrentHashMap<>();
-  private static Map<Set<IndexReader.CacheKey>, FieldInfos> staticSegmentFieldInfos = new ConcurrentHashMap<>();
+  private static MultiFields computeCommitBufferMultiFields(IndexReader reader, Set<IndexReader.CacheKey> mainInputSegmentFields, Map<Set<IndexReader.CacheKey>, MultiFields> mainSegmentFields, List<LeafReader> mainInputLeafReaders, Set<IndexReader.CacheKey> commitBufferIndexKey, Map<Set<IndexReader.CacheKey>, MultiFields> commitBufferSegmentFields, List<LeafReader> commitBufferInputLeafReaders) {
+    Optional<Map.Entry<Set<IndexReader.CacheKey>, MultiFields>> existingFields = commitBufferSegmentFields.entrySet().stream().findFirst();
+    MultiFields multiFields = null;
+
+    if(existingFields.isPresent()){
+      Map.Entry<Set<IndexReader.CacheKey>, MultiFields> existingEntry = existingFields.get();
+      if (existingEntry.getKey().equals(commitBufferIndexKey)) {
+        multiFields = existingEntry.getValue();
+      }
+    }
+
+    if(multiFields == null) {
+      synchronized (commitBufferSegmentFields) {
+        // avoid the compute cost for concurrent threads to all get here and recompute the segment fields.
+        // lookup from the cache again after we acquired the exclusive lock
+        existingFields = commitBufferSegmentFields.entrySet().stream().findFirst();
+        if (existingFields.isPresent() && existingFields.get().getKey().equals(commitBufferIndexKey)) {
+          return existingFields.get().getValue();
+        }
+
+        // not equal but current cache is a subset of new input, we can build from existing cache
+        if(existingFields.isPresent() && commitBufferIndexKey.containsAll(existingFields.get().getKey())){
+          final Map.Entry<Set<IndexReader.CacheKey>, MultiFields> finalExistingFields = existingFields.get();
+          commitBufferInputLeafReaders = commitBufferInputLeafReaders.stream().filter(r -> !finalExistingFields.getKey().contains(r.getCoreCacheHelper().getKey())).collect(Collectors.toList());
+          multiFields = finalExistingFields.getValue();
+        }else {
+          multiFields = computeMainIndexMultiFields(reader, mainInputSegmentFields, mainSegmentFields, mainInputLeafReaders);
+        }
+
+        for (LeafReader commitBufferReader : commitBufferInputLeafReaders) {
+          multiFields = addSegmentFields(commitBufferReader.getContext(), new ArrayList<>(Arrays.asList(multiFields.subs)), new ArrayList<>(Arrays.asList(multiFields.subSlices)));
+        }
+        commitBufferSegmentFields.clear();
+        commitBufferSegmentFields.put(commitBufferIndexKey, multiFields);
+      }
+    }
+    return multiFields;
+  }
+
+
+  private static FieldInfos.Builder computeCommitBufferFieldInfosBuilder(IndexReader reader, Set<IndexReader.CacheKey> mainInputSegmentFields, Map<Set<IndexReader.CacheKey>,
+      FieldInfos.Builder> mainSegmentFieldInfosBuilder, List<LeafReader> mainInputLeafReaders, Set<IndexReader.CacheKey> commitBufferIndexKey, Map<Set<IndexReader.CacheKey>, FieldInfos.Builder> commitBufferSegmentFieldInfosBuilder, List<LeafReader> commitBufferInputLeafReaders,
+                                                                         Map<Set<IndexReader.CacheKey>, FieldInfos> mainIndexSegmentFieldInfos, Map<Set<IndexReader.CacheKey>, FieldInfos> commitBufferSegmentFieldInfos) {
+    Optional<Map.Entry<Set<IndexReader.CacheKey>, FieldInfos.Builder>> existingFields = commitBufferSegmentFieldInfosBuilder.entrySet().stream().findFirst();
+    FieldInfos.Builder builder = null;
+
+    if(existingFields.isPresent()){
+      Map.Entry<Set<IndexReader.CacheKey>, FieldInfos.Builder> existingEntry = existingFields.get();
+      if (existingEntry.getKey().equals(commitBufferIndexKey)) {
+        builder = existingEntry.getValue();
+      }
+    }
+
+    if(builder == null) {
+      synchronized (commitBufferSegmentFieldInfos) {
+        // avoid the compute cost for concurrent threads to all get here and recompute the segment field infos.
+        // lookup from the cache again after we acquired the exclusive lock
+        existingFields = commitBufferSegmentFieldInfosBuilder.entrySet().stream().findFirst();
+        if(existingFields.isPresent() && existingFields.get().getKey().equals(commitBufferIndexKey)){
+          return existingFields.get().getValue();
+        }
+
+        // not equal but current cache is a subset of new input, we can build from existing cache
+        if(existingFields.isPresent() && commitBufferIndexKey.containsAll(existingFields.get().getKey())){
+          final Map.Entry<Set<IndexReader.CacheKey>, FieldInfos.Builder> finalExistingFields = existingFields.get();
+          commitBufferInputLeafReaders = commitBufferInputLeafReaders.stream().filter(r -> !finalExistingFields.getKey().contains(r.getCoreCacheHelper().getKey())).collect(Collectors.toList());
+          builder = finalExistingFields.getValue();
+        }else {
+          builder = computeMainIndexFieldInfosBuilder(reader, mainInputSegmentFields, mainSegmentFieldInfosBuilder, mainInputLeafReaders, mainIndexSegmentFieldInfos);
+        }
+
+        for (LeafReader commitBufferReader : commitBufferInputLeafReaders) {
+          builder = addSegmentFieldInfos(commitBufferReader.getContext(), builder);
+        }
+        commitBufferSegmentFieldInfosBuilder.clear();
+        commitBufferSegmentFieldInfosBuilder.put(commitBufferIndexKey, builder);
+        commitBufferSegmentFieldInfos.clear();
+        commitBufferSegmentFieldInfos.put(commitBufferIndexKey, builder.finish());
+      }
+    }
+
+    return builder;
+  }
+
+/*
+  private static class FieldCacheKey{
+    //IndexReader.CacheKey readerCacheKey;
+    IndexReader.CacheKey coreCacheKey;
+    //String info;
+    Directory directory;
+
+    private FieldCacheKey(Directory directory, LeafReader leafReader) {
+      this.coreCacheKey = leafReader.getCoreCacheHelper().getKey();
+      //this.readerCacheKey = leafReader.getReaderCacheHelper().getKey();
+      //this.info = leafReader.toString();
+      this.directory = directory;
+    }
+
+    private Path path(){
+      Directory unwrappedDir = FilterDirectory.unwrap(directory);
+      return ((FSDirectory) unwrappedDir).getDirectory();
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      FieldCacheKey that = (FieldCacheKey) o;
+      return Objects.equals(coreCacheKey, that.coreCacheKey);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(coreCacheKey);
+    }
+
+    @Override
+    public String toString() {
+      int index = info.indexOf("Uninverting(_");
+      int txFilterCodecIndex = info.indexOf("TxFilterCodecReader(_");
+      int txFilterLeafIndex = info.indexOf("TxFilterLeafReader(_");
+
+      String type="";
+      int start = 0;
+      if(index > 0){
+        start = index+12;
+        type = "";
+      }else if(txFilterCodecIndex > 0){
+        start = txFilterCodecIndex + 20;
+        type = "txc";
+      }else if(txFilterLeafIndex > 0){
+        start = txFilterLeafIndex + 19;
+        type = "txl";
+      }
+
+      return new StringJoiner(", ", FieldCacheKey.class.getSimpleName() + "[", "]")
+          .add("coreCacheKey=" + coreCacheKey)
+          .add("readerCacheKey=" + readerCacheKey)
+          .add("directory=" + directory)
+          .add("info='" + type + ":" + info.substring(start, start + 5) + "'")
+          .toString();
+    }
+  }
+*/
 
   private static FieldInfos.Builder addSegmentFieldInfos(LeafReaderContext ctx, FieldInfos.Builder fieldInfosBuilder){
     String newSoftDeletesField = ctx.reader().getFieldInfos().getSoftDeletesField();
@@ -209,57 +432,112 @@ public final class MultiFields extends Fields {
     return builder;
   }
 
+
+  private static final Map<Directory, Map<Set<IndexReader.CacheKey>, FieldInfos>> mainSegmentFieldInfoCache = new ConcurrentHashMap<>();
+  private static final Map<Directory, Map<Set<IndexReader.CacheKey>, FieldInfos>> commitBufferFieldInfoCache = new ConcurrentHashMap<>();
+  private static final Map<Directory, Map<Set<IndexReader.CacheKey>, FieldInfos>> privateIndexFieldInfoCache = new ConcurrentHashMap<>();
+  private static final Map<Directory, Map<Set<IndexReader.CacheKey>, FieldInfos.Builder>> mainSegmentFieldInfoBuilderCache = new ConcurrentHashMap<>();
+  private static final Map<Directory, Map<Set<IndexReader.CacheKey>, FieldInfos.Builder>> commitBufferFieldInfoBuilderCache = new ConcurrentHashMap<>();
+  private static final Map<Directory, Map<Set<IndexReader.CacheKey>, FieldInfos.Builder>> privateIndexFieldInfoBuilderCache = new ConcurrentHashMap<>();
+
   public static FieldInfos getMergedFieldInfos(IndexReader reader){
 
-    Optional<Map.Entry<Set<IndexReader.CacheKey>, FieldInfos.Builder>> existingSegmentFieldInfosOptional = staticSegmentFieldInfosBuilder.entrySet().stream().findFirst();
-    final Set<IndexReader.CacheKey> inputSegmentFieldsCacheKey = reader.leaves().stream().map(ctx -> ctx.reader().getCoreCacheHelper().getKey()).collect(Collectors.toSet());
-
-    if(existingSegmentFieldInfosOptional.isPresent()){
-      final Map.Entry<Set<IndexReader.CacheKey>, FieldInfos.Builder> existingSegmentFieldInfos = existingSegmentFieldInfosOptional.get();
-      FieldInfos.Builder builder = existingSegmentFieldInfos.getValue();
-
-      // find input leaf readers that are not in the cache
-      List<LeafReaderContext> newLeafReaderFieldInfosContexts = reader.leaves().stream().filter(ctx -> !existingSegmentFieldInfos.getKey().contains(ctx.reader().getCoreCacheHelper().getKey())).collect(Collectors.toList());
-
-      // if there's no merge that caused some segment to be gone since the last time we cache
-      boolean noSegmentMerged = inputSegmentFieldsCacheKey.containsAll(existingSegmentFieldInfos.getKey());
-
-      // if there's no new segments and our existing cached segments are matching the input (segments not merged)
-      if (inputSegmentFieldsCacheKey.equals(existingSegmentFieldInfos.getKey())) {
-        final FieldInfos.Builder finalBuilder = builder;
-        return staticSegmentFieldInfos.computeIfAbsent(inputSegmentFieldsCacheKey, key -> finalBuilder.finish());
-      }else if(!noSegmentMerged){
-        // some cached segments are merged, we need to rebuild
-        synchronized (staticSegmentFieldInfosBuilder) {
-          staticSegmentFieldInfos.remove(existingSegmentFieldInfos.getKey());
-          staticSegmentFieldInfosBuilder.remove(existingSegmentFieldInfos.getKey());
-        }
-      } else if(!newLeafReaderFieldInfosContexts.isEmpty()){
-        // new segments are introduced not already cached
-        synchronized (staticSegmentFieldInfosBuilder) {
-          existingSegmentFieldInfosOptional = staticSegmentFieldInfosBuilder.entrySet().stream().findFirst();
-          if(existingSegmentFieldInfosOptional.isPresent()) {
-            final Map.Entry<Set<IndexReader.CacheKey>, FieldInfos.Builder> synchronizedExistingSegmentFieldInfos = existingSegmentFieldInfosOptional.get();
-            newLeafReaderFieldInfosContexts = reader.leaves().stream().filter(ctx -> !synchronizedExistingSegmentFieldInfos.getKey().contains(ctx.reader().getCoreCacheHelper().getKey())).collect(Collectors.toList());
-            if (!newLeafReaderFieldInfosContexts.isEmpty()) {
-              staticSegmentFieldInfos.remove(synchronizedExistingSegmentFieldInfos.getKey());
-              staticSegmentFieldInfosBuilder.remove(synchronizedExistingSegmentFieldInfos.getKey());
-
-              // if there are changes to segments, we need to find the diff and call addSegmentFieldInfos()
-              for (LeafReaderContext leafReaderContext : newLeafReaderFieldInfosContexts) {
-                builder = addSegmentFieldInfos(leafReaderContext, builder);
-              }
-              staticSegmentFieldInfosBuilder.put(inputSegmentFieldsCacheKey, builder);
-              final FieldInfos.Builder finalBuilder = builder;
-              return staticSegmentFieldInfos.computeIfAbsent(inputSegmentFieldsCacheKey, key -> finalBuilder.finish());
-            }
-          }
-        }
-      }
+    if(!(reader instanceof DirectoryReader)){
+      return doGetMergedFieldInfos(reader).finish();
     }
-    return staticSegmentFieldInfos.computeIfAbsent(inputSegmentFieldsCacheKey, key -> staticSegmentFieldInfosBuilder.computeIfAbsent(inputSegmentFieldsCacheKey, key2 -> doGetMergedFieldInfos(reader)).finish());
-  }
 
+    final DirectoryReader directoryReader = (DirectoryReader) reader;
+    final Directory mainDirectory = directoryReader.directory();
+    final Map<Set<IndexReader.CacheKey>, FieldInfos.Builder> privateIndexSegmentFieldInfoBuilders = privateIndexFieldInfoBuilderCache.computeIfAbsent(mainDirectory, d -> new ConcurrentHashMap<>());
+    final Map<Set<IndexReader.CacheKey>, FieldInfos.Builder> commitBufferSegmentFieldInfoBuilders = commitBufferFieldInfoBuilderCache.computeIfAbsent(mainDirectory, d -> new ConcurrentHashMap<>());
+    final Map<Set<IndexReader.CacheKey>, FieldInfos.Builder> mainIndexSegmentFieldInfoBuilders = mainSegmentFieldInfoBuilderCache.computeIfAbsent(mainDirectory, d -> new ConcurrentHashMap<>());
+    final Map<Set<IndexReader.CacheKey>, FieldInfos> privateIndexSegmentFieldInfos = privateIndexFieldInfoCache.computeIfAbsent(mainDirectory, d -> new ConcurrentHashMap<>());
+    final Map<Set<IndexReader.CacheKey>, FieldInfos> commitBufferSegmentFieldInfos = commitBufferFieldInfoCache.computeIfAbsent(mainDirectory, d -> new ConcurrentHashMap<>());
+    final Map<Set<IndexReader.CacheKey>, FieldInfos> mainIndexSegmentFieldInfos = mainSegmentFieldInfoCache.computeIfAbsent(mainDirectory, d -> new ConcurrentHashMap<>());
+
+
+    final Set<IndexReader.CacheKey> mainInputSegmentFields = new HashSet<>();
+    final Set<IndexReader.CacheKey> commitBufferInputSegmentFields = new HashSet<>();
+    final Set<IndexReader.CacheKey> privateIndexInputSegmentFields = new HashSet<>();
+    final List<LeafReader> mainInputLeafReaders = new LinkedList<>();
+    final List<LeafReader> commitBufferInputLeafReaders = new LinkedList<>();
+    final List<LeafReader> privateIndexInputLeafReaders = new LinkedList<>();
+
+    reader.leaves().forEach(ctx -> {
+      // TODO: .filter(r -> r instanceof CodecReader) and .filter(r -> r instanceof SegmentReader) ?
+      LeafReader leafReader = FilterLeafReader.unwrap(ctx.reader());
+      SegmentReader segmentReader = (SegmentReader) FilterCodecReader.unwrap((CodecReader) leafReader);
+      Directory unwrappedDir = FilterDirectory.unwrap(segmentReader.directory());
+      Path segmentPath = ((FSDirectory) unwrappedDir).getDirectory();
+      IndexReader.CacheKey cacheKey = segmentReader.getCoreCacheHelper().getKey();
+      if(COMMIT_BUFFER_DIR_PATTERN.matcher(segmentPath.toString()).find()){
+        commitBufferInputLeafReaders.add(ctx.reader());
+        commitBufferInputSegmentFields.add(cacheKey);
+      }else if(PRIVATE_INDEX_DIR_PATTERN.matcher(segmentPath.toString()).find()){
+        privateIndexInputLeafReaders.add(ctx.reader());
+        privateIndexInputSegmentFields.add(cacheKey);
+      }else{
+        mainInputLeafReaders.add(ctx.reader());
+        mainInputSegmentFields.add(cacheKey);
+      }
+      //System.out.println("Segment: " + segmentPath + "/" + segmentReader.getSegmentName());
+    });
+
+//    System.out.println("privateIndexFieldInfoCache: " + privateIndexSegmentFieldInfoBuilders.size());
+//    System.out.println("commitBufferSegmentFieldInfoBuilders: " + commitBufferSegmentFieldInfoBuilders.size());
+//    System.out.println("mainIndexSegmentFieldInfoBuilders: " + mainIndexSegmentFieldInfoBuilders.size());
+
+    final Set<IndexReader.CacheKey> commitBufferIndexKey = new HashSet<>();
+    commitBufferIndexKey.addAll(mainInputSegmentFields);
+    commitBufferIndexKey.addAll(commitBufferInputSegmentFields);
+
+    FieldInfos.Builder result;
+    // This is a private index view with txId
+    if(!privateIndexInputLeafReaders.isEmpty()) {
+      final Set<IndexReader.CacheKey> privateIndexKey = new HashSet<>();
+      privateIndexKey.addAll(mainInputSegmentFields);
+      privateIndexKey.addAll(commitBufferInputSegmentFields);
+      privateIndexKey.addAll(privateIndexInputSegmentFields);
+      // We can have 1 cache entry per txId
+      result = privateIndexSegmentFieldInfoBuilders.computeIfAbsent(privateIndexKey, key -> {
+        FieldInfos.Builder builder = computeCommitBufferFieldInfosBuilder(reader,  mainInputSegmentFields, mainIndexSegmentFieldInfoBuilders, mainInputLeafReaders, commitBufferIndexKey, commitBufferSegmentFieldInfoBuilders, commitBufferInputLeafReaders, mainIndexSegmentFieldInfos, commitBufferSegmentFieldInfos);
+        // Build private index multi fields from commitBufferMultiFields and store into cache
+        for (LeafReader commitBufferReader : privateIndexInputLeafReaders) {
+          synchronized (commitBufferSegmentFieldInfos) {
+            builder = addSegmentFieldInfos(commitBufferReader.getContext(), builder);
+          }
+          // register on private index segment closed listener
+          commitBufferReader.getCoreCacheHelper().addClosedListener(closedCacheKey -> {
+            privateIndexSegmentFieldInfoBuilders.entrySet().removeIf(entry -> entry.getKey().contains(closedCacheKey));
+            privateIndexSegmentFieldInfos.entrySet().removeIf(entry -> entry.getKey().contains(closedCacheKey));
+          });
+        }
+        return builder;
+      });
+
+      return privateIndexSegmentFieldInfos.computeIfAbsent(privateIndexKey, key -> {
+        synchronized (commitBufferSegmentFieldInfos){
+          return result.finish();
+        }
+      });
+      // This is a commit buffer only view without txid
+    }else if (!commitBufferInputLeafReaders.isEmpty()){
+      result = computeCommitBufferFieldInfosBuilder(reader, mainInputSegmentFields, mainIndexSegmentFieldInfoBuilders, mainInputLeafReaders, commitBufferIndexKey, commitBufferSegmentFieldInfoBuilders, commitBufferInputLeafReaders, mainIndexSegmentFieldInfos, commitBufferSegmentFieldInfos);
+      FieldInfos fieldInfos = commitBufferSegmentFieldInfos.get(commitBufferIndexKey);
+      if(fieldInfos == null){
+        synchronized (commitBufferSegmentFieldInfos) {
+          return result.finish();
+        }
+      }else{
+        return fieldInfos;
+      }
+      // This is a main index only view
+    }else{
+      result = computeMainIndexFieldInfosBuilder(reader, mainInputSegmentFields, mainIndexSegmentFieldInfoBuilders, mainInputLeafReaders, mainIndexSegmentFieldInfos);
+      FieldInfos fieldInfos = mainIndexSegmentFieldInfos.get(mainInputSegmentFields);
+      return fieldInfos == null? result.finish() : fieldInfos;
+    }
+  }
 
   /** Returns a single {@link Bits} instance for this
    *  reader, merging live Documents on the
@@ -439,7 +717,7 @@ public final class MultiFields extends Fields {
    *  readers, and codec metadata ({@link FieldInfo#getAttribute(String)}
    *  will be unavailable.
    */
-  private static FieldInfos.Builder doGetMergedFieldInfos(IndexReader reader) {
+  private static FieldInfos.Builder doGetMergedFieldInfos(IndexReader reader, Predicate<LeafReader> filter) {
     final List<LeafReaderContext> leaves = reader.leaves();
     if (leaves.isEmpty()) {
       return new FieldInfos.Builder(new FieldInfos.FieldNumbers(null));
@@ -450,10 +728,17 @@ public final class MultiFields extends Fields {
           .findAny().orElse(null);
       final FieldInfos.Builder builder = new FieldInfos.Builder(new FieldInfos.FieldNumbers(softDeletesField));
       for (final LeafReaderContext ctx : leaves) {
+        if(!filter.test(ctx.reader())){
+          continue;
+        }
         builder.add(ctx.reader().getFieldInfos());
       }
       return builder;
     }
+  }
+
+  private static FieldInfos.Builder doGetMergedFieldInfos(IndexReader reader) {
+    return doGetMergedFieldInfos(reader, p -> true);
   }
 
   /** Call this to get the (merged) FieldInfos representing the
@@ -481,7 +766,6 @@ public final class MultiFields extends Fields {
 
     LeafReaderFields(LeafReader leafReader) {
       this.leafReader = leafReader;
-      //this.leafReader.incRef();
       this.indexedFields = new ArrayList<>();
       for (FieldInfo fieldInfo : leafReader.getFieldInfos()) {
         if (fieldInfo.getIndexOptions() != IndexOptions.NONE) {
@@ -505,9 +789,6 @@ public final class MultiFields extends Fields {
     public Terms terms(String field) throws IOException {
       return leafReader.terms(field);
     }
-//    public void close() throws IOException {
-//      leafReader.decRef();
-//    }
   }
 }
 

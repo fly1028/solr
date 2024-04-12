@@ -68,7 +68,7 @@ public final class SlowCompositeReaderWrapper extends LeafReader {
   SlowCompositeReaderWrapper(CompositeReader reader) throws IOException {
     super();
     in = reader;
-    fields = MultiFields.getFields(in);
+    fields = MultiFieldsFactory.getFields(in);
     in.registerParentReader(this);
     if (reader.leaves().isEmpty()) {
       metaData = new LeafMetaData(Version.LATEST.major, Version.LATEST, null);
@@ -85,7 +85,7 @@ public final class SlowCompositeReaderWrapper extends LeafReader {
       }
       metaData = new LeafMetaData(reader.leaves().get(0).reader().getMetaData().getCreatedVersionMajor(), minVersion, null);
     }
-    fieldInfos = MultiFields.getMergedFieldInfos(in);
+    fieldInfos = MultiFieldsFactory.getMergedFieldInfos(in);
   }
 
   @Override
